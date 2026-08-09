@@ -288,21 +288,27 @@ def main():
         "写完之后，这里会显示 0~9 每个数字的概率</div>"
     )
 
-    # 记住最近一次识别，供“分步查看”按钮使用
-    state = {"tensor": None, "link": ""}
+    # 记住最近一次识别，供“分步查看”按钮和放大页面使用
+    state = {"tensor": None, "link": "", "viewer_html": "", "base": ""}
 
     def write_viewer(tensor):
         """把当前数字的独立分步演示页写到文件，并生成“放大”链接。"""
+        html = build_viewer_html(viz_model, tensor)
+        state["viewer_html"] = html
         viewer_path = ROOT / "outputs" / "net_viewer.html"
-        viewer_path.write_text(build_viewer_html(viz_model, tensor), encoding="utf-8")
+        viewer_path.write_text(html, encoding="utf-8")
         state["tensor"] = tensor
-        state["link"] = (
-            f'<a href="{viewer_path.as_uri()}" target="_blank" '
-            'style="font-size:14px;color:#2563eb;font-weight:600;'
-            'text-decoration:none;border:1px solid #bfdbfe;'
-            'border-radius:10px;padding:6px 12px;display:inline-block;'
-            'background:#eff6ff;">🔍 放大 · 分步演示（新窗口）</a>'
-        )
+        base = state.get("base") or ""
+        if base:
+            state["link"] = (
+                f'<a href="{base}/net-viewer" target="_blank" '
+                'style="font-size:14px;color:#2563eb;font-weight:600;'
+                'text-decoration:none;border:1px solid #bfdbfe;'
+                'border-radius:10px;padding:6px 12px;display:inline-block;'
+                'background:#eff6ff;">🔍 放大 · 分步演示（新窗口）</a>'
+            )
+        else:
+            state["link"] = ""
 
     def handle(img):
         top, bars, msg, _ = predict(model, img)
@@ -509,19 +515,44 @@ def main():
             outputs=[top_html, bars_html, msg, net_html, viewer_link],
         )
 
-    # 预启动处理队列 + 预热，避免第一次手写"没反应"
+    # 预启动处理队列，避免第一次手写"没反应"
     demo.queue(default_concurrency_limit=4)
+    launch_kwargs["prevent_thread_lock"] = True
+    demo.launch(**launch_kwargs)
+
+    # 注册“放大分步演示”页面路由（返回内存中的最新 viewer HTML）
+    from fastapi.responses import HTMLResponse
+
+    @demo.app.get("/net-viewer")
+    def _serve_viewer():
+        html = state.get("viewer_html") or (
+            "<div style='font-family:sans-serif;padding:40px;color:#64748b;'>"
+            "先在手写面板写一个数字，再打开这里。</div>"
+        )
+        return HTMLResponse(html, media_type="text/html; charset=utf-8")
+
+    state["base"] = (
+        getattr(demo, "share_url", None) or getattr(demo, "local_url", "") or ""
+    ).rstrip("/")
+
+    # 启动后预热：让第一次手写也立即出结果，并让放大链接立即可用
     try:
         if example_paths:
             warm = np.asarray(
                 Image.open(example_paths[0]).convert("L"), dtype=np.float32
             )
             handle(warm)
-            print("预热完成：模型、特征图与页面组件已就绪")
+            print("预热完成：模型、特征图、放大分步页已就绪")
     except Exception as exc:
         print(f"预热未完成（不影响使用）: {exc}")
 
-    demo.launch(**launch_kwargs)
+    if hasattr(demo, "block_thread"):
+        demo.block_thread()
+    else:
+        import time
+
+        while True:
+            time.sleep(3600)
 
 
 if __name__ == "__main__":

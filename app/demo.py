@@ -305,7 +305,7 @@ def main():
         )
 
     def handle(img):
-        top, bars, msg, canvas = predict(model, img)
+        top, bars, msg, _ = predict(model, img)
         _, _, tensor = classify(model, img)
         if tensor is not None:
             viz = build_cnn_html(viz_model, tensor)
@@ -314,7 +314,7 @@ def main():
             viz = build_empty_html()
             state["tensor"] = None
             state["link"] = ""
-        return top, bars, msg, canvas, viz, state["link"]
+        return top, bars, msg, viz, state["link"]
 
     def show_step(step):
         if state["tensor"] is None:
@@ -332,14 +332,13 @@ def main():
     def on_challenge(path, true_label):
         """挑战题：识别后揭晓答案，讲解模型的盲区。"""
         img = np.asarray(Image.open(path).convert("L"), dtype=np.float32)
-        probs, canvas, tensor = classify(model, img)
+        probs, _, tensor = classify(model, img)
         if probs is None:
             return (
                 gr.update(value=path),
                 empty_top,
                 empty_bars,
                 "",
-                None,
                 build_empty_html(),
                 state["link"],
             )
@@ -359,7 +358,6 @@ def main():
             render_top(top1, conf),
             render_bars(probs),
             reveal,
-            (canvas * 255).astype(np.uint8),
             build_cnn_html(viz_model, tensor),
             state["link"],
         )
@@ -409,19 +407,6 @@ def main():
                     top_html = gr.HTML(empty_top)
                     bars_html = gr.HTML(empty_bars)
                     msg = gr.Markdown("")
-                with gr.Column(elem_classes=["card"]):
-                    gr.Markdown("### 🔎 模型看到的输入", elem_classes=["section-title"])
-                    with gr.Row():
-                        small_img = gr.Image(
-                            height=170,
-                            width=170,
-                            interactive=False,
-                            show_label=False,
-                        )
-                        gr.Markdown(
-                            "这是模型**真正看到的 28×28**：图片 = 数字表格。\n\n"
-                            "写完后，这里会实时更新。"
-                        )
 
         # 计算过程动画
         with gr.Column(elem_classes=["card"]):
@@ -496,7 +481,6 @@ def main():
                                             top_html,
                                             bars_html,
                                             msg,
-                                            small_img,
                                             net_html,
                                             viewer_link,
                                         ],
@@ -512,17 +496,17 @@ def main():
         sketch.input(
             fn=handle,
             inputs=sketch,
-            outputs=[top_html, bars_html, msg, small_img, net_html, viewer_link],
+            outputs=[top_html, bars_html, msg, net_html, viewer_link],
         )
         btn_random.click(random_example, outputs=sketch).then(
             fn=handle,
             inputs=sketch,
-            outputs=[top_html, bars_html, msg, small_img, net_html, viewer_link],
+            outputs=[top_html, bars_html, msg, net_html, viewer_link],
         )
         btn_go.click(
             fn=handle,
             inputs=sketch,
-            outputs=[top_html, bars_html, msg, small_img, net_html, viewer_link],
+            outputs=[top_html, bars_html, msg, net_html, viewer_link],
         )
 
     # 预启动处理队列 + 预热，避免第一次手写"没反应"

@@ -1,0 +1,62 @@
+{
+  "challenge_0_0to6.png": {
+    "true": 0,
+    "pred": 6,
+    "conf": 0.9963
+  },
+  "challenge_1_0to5.png": {
+    "true": 0,
+    "pred": 5,
+    "conf": 0.9512
+  },
+  "challenge_2_1to2.png": {
+    "true": 1,
+    "pred": 2,
+    "conf": 0.695
+  },
+  "challenge_3_2to7.png": {
+    "true": 2,
+    "pred": 7,
+    "conf": 0.9785
+  },
+  "challenge_4_2to7.png": {
+    "true": 2,
+    "pred": 7,
+    "conf": 0.9737
+  },
+  "challenge_5_3to5.png": {
+    "true": 3,
+    "pred": 5,
+    "conf": 0.9949
+  },
+  "challenge_6_3to5.png": {
+    "true": 3,
+    "pred": 5,
+    "conf": 0.9775
+  },
+  "challenge_7_4to9.png": {
+    "true": 4,
+    "pred": 9,
+    "conf": 0.9762
+  },
+  "challenge_8_4to9.png": {
+    "true": 4,
+    "pred": 9,
+    "conf": 0.9654
+  },
+  "challenge_9_5to6.png": {
+    "true": 5,
+    "pred": 6,
+    "conf": 0.8991
+  },
+  "challenge_10_5to3.png": {
+    "true": 5,
+    "pred": 3,
+    "conf": 0.7444
+  },
+  "challenge_11_6to4.png": {
+    "true": 6,
+    "pred": 4,
+    "conf": 0.9991
+  }
+}

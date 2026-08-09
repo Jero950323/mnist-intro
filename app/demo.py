@@ -21,6 +21,16 @@ os.environ.setdefault("OMP_NUM_THREADS", "2")
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
+import matplotlib
+
+matplotlib.use("Agg")  # 服务器端绘图，不弹窗
+matplotlib.rcParams["font.sans-serif"] = [
+    "Microsoft YaHei",
+    "SimHei",
+    "Arial Unicode MS",
+    "DejaVu Sans",
+]
+matplotlib.rcParams["axes.unicode_minus"] = False
 import numpy as np
 import torch
 import gradio as gr
@@ -93,13 +103,13 @@ def render_top(top1, conf):
 
 
 def classify(model, img):
-    """把画板输入转成 28x28 并预测，返回 (probs, canvas)。
+    """把画板输入转成 28x28 并预测，返回 (probs, canvas, tensor)。
 
-    输入为空时返回 (None, None)。probs 是 10 个数字的概率，
+    输入为空时返回 (None, None, None)。probs 是 10 个数字的概率，
     canvas 是 0~1 的 28x28 灰度图（页面展示“模型看到的样子”）。
     """
     if img is None:
-        return None, None
+        return None, None, None
 
     # Gradio 6 的 Sketchpad 会传入 dict（background/layers/composite），
     # 旧版本则直接传 numpy 数组，这里兼容两种格式
@@ -107,16 +117,16 @@ def classify(model, img):
         composite = img.get("composite")
         img = composite if composite is not None else img.get("background")
     if img is None:
-        return None, None
+        return None, None, None
 
     result = preprocess_digit(img)
     if result is None:
-        return None, None
+        return None, None, None
 
     tensor, canvas = result
     with torch.no_grad():
         probs = torch.softmax(model(tensor), dim=1)[0].numpy()
-    return probs, canvas
+    return probs, canvas, tensor
 
 
 def predict(model, img):
@@ -129,7 +139,7 @@ def predict(model, img):
         "<div style='text-align:center;color:#94a3b8;padding:12px;'>"
         "写完之后，这里会显示 0~9 每个数字的概率</div>"
     )
-    probs, canvas = classify(model, img)
+    probs, canvas, _ = classify(model, img)
     if probs is None:
         return empty_top, empty_bars, "", None
 
@@ -146,6 +156,77 @@ def predict(model, img):
         msg,
         (canvas * 255).astype(np.uint8),
     )
+
+
+def render_network(mlp, tensor):
+    """把 MLP 的实时计算过程画出来：输入 → 隐藏层激活 → 10 个输出概率。"""
+    import matplotlib.pyplot as plt
+
+    with torch.no_grad():
+        x = tensor.view(1, -1)  # 784 个输入像素
+        h = torch.relu(mlp.fc1(x))  # 隐藏层 128 个神经元
+        logits = mlp.fc2(h)  # 输出层 10 个节点
+        probs = torch.softmax(logits, dim=1)[0].numpy()
+
+    canvas = tensor[0, 0].numpy() * 0.3081 + 0.1307  # 还原回 0~1 灰度
+    hid = h[0].numpy()
+
+    fig, axes = plt.subplots(
+        1, 3, figsize=(13.5, 4.3), gridspec_kw={"width_ratios": [1, 1.4, 1.15]}
+    )
+
+    # 1) 输入层：28x28 像素
+    axes[0].imshow(canvas, cmap="gray", vmin=0, vmax=1)
+    axes[0].set_title("输入层\n784 个像素", fontsize=11)
+    axes[0].axis("off")
+
+    # 2) 隐藏层：128 个神经元的激活值（越亮 = 被激活得越强）
+    grid = hid.reshape(8, 16)
+    vmax = max(1e-6, float(hid.max()))
+    im = axes[1].imshow(grid, cmap="Reds", vmin=0, vmax=vmax, aspect="auto")
+    axes[1].set_title("隐藏层\n128 个神经元（实时激活值）", fontsize=11)
+    axes[1].set_xticks([])
+    axes[1].set_yticks([])
+    plt.colorbar(im, ax=axes[1], fraction=0.046, pad=0.04)
+
+    # 3) 输出层：0~9 共 10 个节点，按概率排序点亮
+    top1 = int(probs.argmax())
+    colors = ["#2563eb" if i == top1 else "#cbd5e1" for i in range(10)]
+    axes[2].barh(range(10), probs, color=colors)
+    axes[2].set_yticks(range(10))
+    axes[2].set_yticklabels([str(i) for i in range(10)], fontsize=12, fontweight="bold")
+    axes[2].invert_yaxis()
+    axes[2].set_xlim(0, 1)
+    axes[2].set_title("输出层\n0~9 共 10 个节点（概率）", fontsize=11)
+    axes[2].set_xlabel("概率")
+    for i, p in enumerate(probs):
+        axes[2].text(p + 0.01, i, f"{p:.1%}", va="center", fontsize=9)
+
+    fig.suptitle(
+        "神经网络计算过程：手写输入 → 每一层逐步计算 → 10 个数字的概率",
+        fontsize=13,
+        y=1.03,
+    )
+    fig.tight_layout()
+    return fig
+
+
+def blank_network_fig():
+    """没有输入时展示的占位图。"""
+    import matplotlib.pyplot as plt
+
+    fig, ax = plt.subplots(figsize=(13.5, 4.3))
+    ax.text(
+        0.5,
+        0.5,
+        "写一个数字后，这里会展示神经网络每一层的实时计算",
+        ha="center",
+        va="center",
+        fontsize=14,
+        color="#94a3b8",
+    )
+    ax.axis("off")
+    return fig
 
 
 def load_challenges(examples_dir):
@@ -228,6 +309,7 @@ def main():
     args = parser.parse_args()
 
     model = load_model(args.model, args.checkpoint)
+    mlp_model = load_model("mlp", "outputs/mlp_mnist.pth")
 
     example_paths = [
         str(p) for p in sorted((ROOT / "outputs" / "examples").glob("digit_*.png"))
@@ -244,7 +326,10 @@ def main():
     )
 
     def handle(img):
-        return predict(model, img)
+        top, bars, msg, canvas = predict(model, img)
+        _, _, tensor = classify(model, img)
+        fig = render_network(mlp_model, tensor) if tensor is not None else blank_network_fig()
+        return top, bars, msg, canvas, fig
 
     def random_example():
         return gr.update(value=random.choice(example_paths))
@@ -252,9 +337,16 @@ def main():
     def on_challenge(path, true_label):
         """挑战题：识别后揭晓答案，讲解模型的盲区。"""
         img = np.asarray(Image.open(path).convert("L"), dtype=np.float32)
-        probs, canvas = classify(model, img)
+        probs, canvas, tensor = classify(model, img)
         if probs is None:
-            return gr.update(value=path), empty_top, empty_bars, "", None
+            return (
+                gr.update(value=path),
+                empty_top,
+                empty_bars,
+                "",
+                None,
+                blank_network_fig(),
+            )
         top1 = int(probs.argmax())
         conf = float(probs[top1])
         if true_label == top1:
@@ -271,6 +363,7 @@ def main():
             render_bars(probs),
             reveal,
             (canvas * 255).astype(np.uint8),
+            render_network(mlp_model, tensor),
         )
 
     # Gradio 6 把 css/theme 参数移到了 launch()，这里做版本兼容
@@ -320,6 +413,17 @@ def main():
                     )
                     msg = gr.Markdown("")
 
+        with gr.Column(elem_classes=["result-card"]):
+            gr.Markdown(
+                "### 🔍 神经网络内部是怎么算的\n"
+                "左边是输入图片，中间是隐藏层 **128 个神经元**的实时激活值"
+                "（越亮 = 被激活得越强），右边是 **0~9 共 10 个输出节点**的概率。"
+                "这里用结构透明的 MLP 做演示；页面识别用的仍是更准的 CNN。"
+            )
+            net_fig = gr.Plot(
+                label="神经网络实时计算（MLP：784 → 128 → 10）",
+            )
+
         gr.Examples(
             examples=[[p] for p in example_paths],
             inputs=sketch,
@@ -355,18 +459,19 @@ def main():
                                         bars_html,
                                         msg,
                                         small_img,
+                                        net_fig,
                                     ],
                                 )
 
         sketch.input(
             fn=handle,
             inputs=sketch,
-            outputs=[top_html, bars_html, msg, small_img],
+            outputs=[top_html, bars_html, msg, small_img, net_fig],
         )
         btn_random.click(random_example, outputs=sketch).then(
             fn=handle,
             inputs=sketch,
-            outputs=[top_html, bars_html, msg, small_img],
+            outputs=[top_html, bars_html, msg, small_img, net_fig],
         )
 
     demo.launch(**launch_kwargs)

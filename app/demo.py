@@ -21,22 +21,13 @@ os.environ.setdefault("OMP_NUM_THREADS", "2")
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-import matplotlib
-
-matplotlib.use("Agg")  # 服务器端绘图，不弹窗
-matplotlib.rcParams["font.sans-serif"] = [
-    "Microsoft YaHei",
-    "SimHei",
-    "Arial Unicode MS",
-    "DejaVu Sans",
-]
-matplotlib.rcParams["axes.unicode_minus"] = False
 import numpy as np
 import torch
 import gradio as gr
 from PIL import Image
 
 from src.model import build_model
+from src.network_viz import build_empty_html, build_network_html
 from src.preprocess import preprocess_digit
 
 
@@ -158,77 +149,6 @@ def predict(model, img):
     )
 
 
-def render_network(mlp, tensor):
-    """把 MLP 的实时计算过程画出来：输入 → 隐藏层激活 → 10 个输出概率。"""
-    import matplotlib.pyplot as plt
-
-    with torch.no_grad():
-        x = tensor.view(1, -1)  # 784 个输入像素
-        h = torch.relu(mlp.fc1(x))  # 隐藏层 128 个神经元
-        logits = mlp.fc2(h)  # 输出层 10 个节点
-        probs = torch.softmax(logits, dim=1)[0].numpy()
-
-    canvas = tensor[0, 0].numpy() * 0.3081 + 0.1307  # 还原回 0~1 灰度
-    hid = h[0].numpy()
-
-    fig, axes = plt.subplots(
-        1, 3, figsize=(13.5, 4.3), gridspec_kw={"width_ratios": [1, 1.4, 1.15]}
-    )
-
-    # 1) 输入层：28x28 像素
-    axes[0].imshow(canvas, cmap="gray", vmin=0, vmax=1)
-    axes[0].set_title("输入层\n784 个像素", fontsize=11)
-    axes[0].axis("off")
-
-    # 2) 隐藏层：128 个神经元的激活值（越亮 = 被激活得越强）
-    grid = hid.reshape(8, 16)
-    vmax = max(1e-6, float(hid.max()))
-    im = axes[1].imshow(grid, cmap="Reds", vmin=0, vmax=vmax, aspect="auto")
-    axes[1].set_title("隐藏层\n128 个神经元（实时激活值）", fontsize=11)
-    axes[1].set_xticks([])
-    axes[1].set_yticks([])
-    plt.colorbar(im, ax=axes[1], fraction=0.046, pad=0.04)
-
-    # 3) 输出层：0~9 共 10 个节点，按概率排序点亮
-    top1 = int(probs.argmax())
-    colors = ["#2563eb" if i == top1 else "#cbd5e1" for i in range(10)]
-    axes[2].barh(range(10), probs, color=colors)
-    axes[2].set_yticks(range(10))
-    axes[2].set_yticklabels([str(i) for i in range(10)], fontsize=12, fontweight="bold")
-    axes[2].invert_yaxis()
-    axes[2].set_xlim(0, 1)
-    axes[2].set_title("输出层\n0~9 共 10 个节点（概率）", fontsize=11)
-    axes[2].set_xlabel("概率")
-    for i, p in enumerate(probs):
-        axes[2].text(p + 0.01, i, f"{p:.1%}", va="center", fontsize=9)
-
-    fig.suptitle(
-        "神经网络计算过程：手写输入 → 每一层逐步计算 → 10 个数字的概率",
-        fontsize=13,
-        y=1.03,
-    )
-    fig.tight_layout()
-    return fig
-
-
-def blank_network_fig():
-    """没有输入时展示的占位图。"""
-    import matplotlib.pyplot as plt
-
-    fig, ax = plt.subplots(figsize=(13.5, 4.3))
-    ax.text(
-        0.5,
-        0.5,
-        "写一个数字后，这里会展示神经网络每一层的实时计算",
-        ha="center",
-        va="center",
-        fontsize=14,
-        color="#94a3b8",
-    )
-    ax.axis("off")
-    return fig
-
-
 def load_challenges(examples_dir):
     """读取挑战题（模型会认错的疑难样本），返回 [(图片路径, 正确答案), ...]。"""
     examples_dir = Path(examples_dir)
@@ -328,8 +248,12 @@ def main():
     def handle(img):
         top, bars, msg, canvas = predict(model, img)
         _, _, tensor = classify(model, img)
-        fig = render_network(mlp_model, tensor) if tensor is not None else blank_network_fig()
-        return top, bars, msg, canvas, fig
+        viz = (
+            build_network_html(mlp_model, tensor)
+            if tensor is not None
+            else build_empty_html()
+        )
+        return top, bars, msg, canvas, viz
 
     def random_example():
         return gr.update(value=random.choice(example_paths))
@@ -345,7 +269,7 @@ def main():
                 empty_bars,
                 "",
                 None,
-                blank_network_fig(),
+                build_empty_html(),
             )
         top1 = int(probs.argmax())
         conf = float(probs[top1])
@@ -363,7 +287,7 @@ def main():
             render_bars(probs),
             reveal,
             (canvas * 255).astype(np.uint8),
-            render_network(mlp_model, tensor),
+            build_network_html(mlp_model, tensor),
         )
 
     # Gradio 6 把 css/theme 参数移到了 launch()，这里做版本兼容
@@ -419,10 +343,10 @@ def main():
                 "左边是输入图片，中间是隐藏层 **128 个神经元**的实时激活值"
                 "（越亮 = 被激活得越强），右边是 **0~9 共 10 个输出节点**的概率。"
                 "这里用结构透明的 MLP 做演示；页面识别用的仍是更准的 CNN。"
+                "动画会循环流动：输入像素点亮 → 连接线脉冲 → 隐藏层神经元点亮 → "
+                "连接线脉冲 → 输出层节点给出概率。"
             )
-            net_fig = gr.Plot(
-                label="神经网络实时计算（MLP：784 → 128 → 10）",
-            )
+            net_html = gr.HTML(build_empty_html())
 
         gr.Examples(
             examples=[[p] for p in example_paths],
@@ -459,19 +383,19 @@ def main():
                                         bars_html,
                                         msg,
                                         small_img,
-                                        net_fig,
+                                        net_html,
                                     ],
                                 )
 
         sketch.input(
             fn=handle,
             inputs=sketch,
-            outputs=[top_html, bars_html, msg, small_img, net_fig],
+            outputs=[top_html, bars_html, msg, small_img, net_html],
         )
         btn_random.click(random_example, outputs=sketch).then(
             fn=handle,
             inputs=sketch,
-            outputs=[top_html, bars_html, msg, small_img, net_fig],
+            outputs=[top_html, bars_html, msg, small_img, net_html],
         )
 
     demo.launch(**launch_kwargs)

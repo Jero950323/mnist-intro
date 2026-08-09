@@ -130,9 +130,18 @@ def predict(model, img):
         "<div style='text-align:center;color:#94a3b8;padding:12px;'>"
         "写完之后，这里会显示 0~9 每个数字的概率</div>"
     )
+    if img is None:
+        return empty_top, empty_bars, "", None
     probs, canvas, _ = classify(model, img)
     if probs is None:
-        return empty_top, empty_bars, "", None
+        # 画板有事件但没拿到有效笔画（例如第一次落笔画板还没初始化）
+        return (
+            "<div style='text-align:center;color:#f59e0b;font-size:16px;padding:30px 0;'>"
+            "没有识别到笔画，请再写一次，或点击左侧「🔍 识别」按钮</div>",
+            empty_bars,
+            "",
+            None,
+        )
 
     top1 = int(probs.argmax())
     conf = float(probs[top1])
@@ -315,6 +324,7 @@ def main():
                 sketch = build_sketchpad()
                 with gr.Row():
                     btn_random = gr.Button("🎲 随机示例", variant="secondary")
+                    btn_go = gr.Button("🔍 识别", variant="primary")
                 gr.Markdown(
                     "**提示**：写大、写粗、写中间最准；“1”直接画一根竖线。",
                     elem_id="tips",
@@ -398,6 +408,26 @@ def main():
             inputs=sketch,
             outputs=[top_html, bars_html, msg, small_img, net_html],
         )
+        # 兜底按钮：画完点击也能识别（第一次落笔事件偶尔不触发时用）
+        btn_go.click(
+            fn=handle,
+            inputs=sketch,
+            outputs=[top_html, bars_html, msg, small_img, net_html],
+        )
+
+    # 预启动处理队列，避免第一次请求才启动、感觉“卡住没反应”
+    demo.queue(default_concurrency_limit=4)
+
+    # 预热：启动时先完整跑一次识别流程，让第一次手写也能立即出结果
+    try:
+        if example_paths:
+            warm = np.asarray(
+                Image.open(example_paths[0]).convert("L"), dtype=np.float32
+            )
+            handle(warm)
+            print("预热完成：模型、特征图与页面组件已就绪")
+    except Exception as exc:  # 预热失败不影响使用
+        print(f"预热未完成（不影响使用）: {exc}")
 
     demo.launch(**launch_kwargs)
 

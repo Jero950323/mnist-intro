@@ -1,11 +1,12 @@
 """CNN 实时计算可视化（小白版）：
 特征图动画 + 全连接层打分条 + Grad-CAM“为什么”证据图。
 
-动画流程（循环约 4.2 秒）：
-你写的数字 -> 卷积层1（32 张特征图）-> 卷积层2（64 张）-> 池化（64 张 7×7）
--> 全连接层投票打分（10 个数字各得一分）-> 输出层给出概率
--> 最下面的“为什么”高亮图说明模型重点看了哪里。
-所有数据都是模型真实的中间计算结果，不是示意图。
+提供三种形态：
+1. build_cnn_html(cnn, tensor)          —— 页面内自动循环动画
+2. build_cnn_html(cnn, tensor, step=n)  —— 页面内分步（1~7，只显示到第 n 步）
+3. build_viewer_html(cnn, tensor)       —— 独立大图页面，可上一步/下一步/自动播放
+
+所有数据都是模型真实的中间计算结果（前向 + 反向），不是示意图。
 """
 
 import base64
@@ -56,7 +57,6 @@ def _to_data_uri(pil_img):
 
 
 def _grayscale_uri(canvas, size):
-    """28x28 灰度 -> 放大后的 PNG data URI。"""
     img = Image.fromarray((canvas * 255).astype(np.uint8), mode="L").resize(
         (size, size), Image.LANCZOS
     )
@@ -72,24 +72,21 @@ def _gradcam_overlay(canvas, cam_14):
         (28, 28), Image.LANCZOS
     )
     cam_28 = np.asarray(cam_img, dtype=np.float32) / 255.0
-
-    base = np.stack([canvas] * 3, axis=-1)  # (28,28,3)
+    base = np.stack([canvas] * 3, axis=-1)
     heat = _hot_rgb(cam_28) / 255.0
     blend = np.clip(0.45 * base + 0.55 * heat, 0, 1)
     return (blend * 255).astype(np.uint8)
 
 
-# ---------- 主入口 ----------
+# ---------- 计算一次前向 + Grad-CAM，收集所有素材 ----------
 
 
-def build_cnn_html(cnn, tensor):
-    """根据 CNN 的一次真实前向传播 + 反向传播，生成完整教学动画 HTML。"""
-    # 一次前向（带梯度，用于 Grad-CAM），同时用钩子取卷积层输出
+def _compute_features(cnn, tensor):
     activations = {}
 
     def make_hook(name):
         def hook(module, inp, out):
-            out.retain_grad()  # 中间层输出默认不留梯度，需要显式保留
+            out.retain_grad()
             activations[name] = out
 
         return hook
@@ -102,37 +99,61 @@ def build_cnn_html(cnn, tensor):
     probs = torch.softmax(out[0], dim=0).detach().numpy()
     top1 = int(logits.argmax())
 
-    # Grad-CAM：求“最可能的数字”对卷积层2输出的梯度，得到每个特征图的重要性
     out[0, top1].backward()
-    grads = activations["conv2"].grad[0].detach()  # (64, 14, 14)
+    grads = activations["conv2"].grad[0].detach()
     h1.remove()
     h2.remove()
 
-    a1 = torch.relu(activations["conv1"][0]).detach().numpy()  # (32, 28, 28)
-    a2 = torch.relu(activations["conv2"][0]).detach().numpy()  # (64, 14, 14)
+    a1 = torch.relu(activations["conv1"][0]).detach().numpy()  # (32,28,28)
+    a2 = torch.relu(activations["conv2"][0]).detach().numpy()  # (64,14,14)
     p2 = F.max_pool2d(torch.relu(activations["conv2"][0]), 2).detach().numpy()  # (64,7,7)
 
-    w_cam = grads.mean(dim=(1, 2))  # (64,) 每张特征图的重要性
-    cam_14 = np.maximum((w_cam.numpy()[:, None, None] * a2).sum(axis=0), 0)  # (14,14)
+    w_cam = grads.mean(dim=(1, 2)).numpy()  # (64,)
+    cam_14 = np.maximum((w_cam[:, None, None] * a2).sum(axis=0), 0)  # (14,14)
 
     canvas = (tensor[0, 0].numpy() * 0.3081 + 0.1307).clip(0, 1)
-    uri_in = _grayscale_uri(canvas, 120)
-    uri_c1 = _to_data_uri(_feature_montage(a1, cols=8, cell=22))
-    uri_c2 = _to_data_uri(_feature_montage(a2, cols=8, cell=15))
-    uri_p2 = _to_data_uri(_feature_montage(p2, cols=8, cell=15))
-    uri_cam = _to_data_uri(
-        Image.fromarray(_gradcam_overlay(canvas, cam_14)).resize((200, 200), Image.LANCZOS)
-    )
+    return {
+        "probs": probs,
+        "logits": logits,
+        "top1": top1,
+        "canvas": canvas,
+        "uri_in": _grayscale_uri(canvas, 120),
+        "uri_c1": _to_data_uri(_feature_montage(a1, cols=8, cell=22)),
+        "uri_c2": _to_data_uri(_feature_montage(a2, cols=8, cell=15)),
+        "uri_p2": _to_data_uri(_feature_montage(p2, cols=8, cell=15)),
+        "uri_cam": _to_data_uri(
+            Image.fromarray(_gradcam_overlay(canvas, cam_14)).resize(
+                (200, 200), Image.LANCZOS
+            )
+        ),
+    }
 
-    # ---------- 第一行：流程面板 ----------
+
+# ---------- 生成 SVG（按步骤分组） ----------
+
+
+def _build_svg(assets, step=None, for_viewer=False, svg_class=""):
+    """生成 SVG。step: 1~7 只显示到第 n 步；None 表示全部显示（页面自动动画）。
+    for_viewer=True 时给每组加 data-step 属性，交给独立页面的 JS 控制。"""
+    probs, logits, top1 = assets["probs"], assets["logits"], assets["top1"]
+
+    def g(step_no, content):
+        if for_viewer:
+            return f'<g data-step="{step_no}">{content}</g>'
+        if step is None:
+            return f"<g>{content}</g>"
+        return f'<g style="opacity:{1 if step_no <= step else 0}">{content}</g>'
+
+    # 布局
     inp_x, inp_y, inp_w, inp_h = 30, 60, 170, 300
     c1_x, c1_y, c1_w, c1_h = 240, 60, 250, 300
     c2_x, c2_y, c2_w, c2_h = 530, 60, 250, 300
     p2_x, p2_y, p2_w, p2_h = 820, 60, 250, 300
     out_x, out_y, out_w, out_h = 1110, 60, 360, 300
+    vote_x, vote_y, vote_w, vote_h = 30, 400, 760, 270
+    cam_x, cam_y, cam_w, cam_h = 820, 400, 650, 270
 
     panels = []
-    titles = []
     for x, y, w, h in [
         (inp_x, inp_y, inp_w, inp_h),
         (c1_x, c1_y, c1_w, c1_h),
@@ -157,9 +178,10 @@ def build_cnn_html(cnn, tensor):
         f'font-size="14" font-weight="700" fill="#334155">⑥ 结果：谁分高谁是答案</text>',
     ]
 
-    input_img = (
-        f'<image href="{uri_in}" x="{inp_x + (inp_w - 120) // 2}" y="{inp_y + 55}" '
-        f'width="120" height="120" class="in-img"/>'
+    # 第 1 步：输入
+    step1 = (
+        f'<image href="{assets["uri_in"]}" x="{inp_x + (inp_w - 120) // 2}" '
+        f'y="{inp_y + 55}" width="120" height="120" class="in-img"/>'
         f'<text x="{inp_x + inp_w // 2}" y="{inp_y + 210}" text-anchor="middle" '
         f'font-size="12" fill="#64748b">每个格子 = 一个像素的明暗</text>'
     )
@@ -173,16 +195,8 @@ def build_cnn_html(cnn, tensor):
             f'text-anchor="middle" font-size="12" fill="#64748b">{caption}</text>'
         )
 
-    stages = (
-        _stage(uri_c1, c1_x, c1_w, 194, 98, "fm1", "越亮 = 越像某个小模板", 130)
-        + _stage(uri_c2, c2_x, c2_w, 138, 138, "fm2", "组合成横、竖、圈等", 130)
-        + _stage(uri_p2, p2_x, p2_w, 138, 138, "fm3", "只留最明显的特征", 130)
-    )
-
-    # 第一行：输入 -> 卷积1 -> 卷积2 -> 池化 -> 输出 的箭头
-    arrows = []
-    for ax, cls in [(220, "arrow1"), (500, "arrow2"), (790, "arrow3"), (1080, "arrow4")]:
-        arrows.append(
+    def _arrow(ax, cls):
+        return (
             f'<g class="{cls}">'
             f'<line x1="{ax - 12}" y1="210" x2="{ax + 10}" y2="210" '
             f'stroke="#94a3b8" stroke-width="3" stroke-linecap="round"/>'
@@ -190,7 +204,60 @@ def build_cnn_html(cnn, tensor):
             "</g>"
         )
 
-    # 输出层：10 个节点 + 概率
+    # 第 2~4 步：卷积/池化特征图 + 箭头
+    step2 = _arrow(220, "arrow1") + _stage(
+        assets["uri_c1"], c1_x, c1_w, 194, 98, "fm1", "越亮 = 越像某个小模板", 130
+    )
+    step3 = _arrow(500, "arrow2") + _stage(
+        assets["uri_c2"], c2_x, c2_w, 138, 138, "fm2", "组合成横、竖、圈等", 130
+    )
+    step4 = _arrow(790, "arrow3") + _stage(
+        assets["uri_p2"], p2_x, p2_w, 138, 138, "fm3", "只留最明显的特征", 130
+    )
+
+    # 第 5 步：投票打分
+    max_abs = max(float(np.abs(logits).max()), 1e-6)
+    bar_max_w = 300
+    zero_x = vote_x + 300
+    bars = []
+    for i in range(10):
+        s = float(logits[i])
+        w = abs(s) / max_abs * bar_max_w
+        cy = vote_y + 52 + i * 21
+        is_top = i == top1
+        if s >= 0:
+            x0, origin = zero_x, "0% 50%"
+            color = "#2563eb" if is_top else "#93c5fd"
+        else:
+            x0, origin = zero_x - w, "100% 50%"
+            color = "#94a3b8"
+        bars.append(
+            f'<text x="{vote_x + 30}" y="{cy + 4}" text-anchor="middle" font-size="12" '
+            f'font-weight="bold" fill="{("#1d4ed8" if is_top else "#475569")}">{i}</text>'
+            f'<rect x="{x0:.1f}" y="{cy - 8}" width="{w:.1f}" height="16" rx="4" '
+            f'fill="{color}" class="score-bar" '
+            f'style="animation-delay:-2.35s;transform-box:fill-box;transform-origin:{origin}"/>'
+            f'<text x="{x0 + (8 if s >= 0 else -8)}" y="{cy + 4}" font-size="11" '
+            f'font-family="Consolas,monospace" fill="#475569" '
+            f'text-anchor="{("start" if s >= 0 else "end")}" '
+            f'class="score-label">{s:+.2f}</text>'
+        )
+    bars.append(
+        f'<line x1="{zero_x}" y1="{vote_y + 40}" x2="{zero_x}" y2="{vote_y + 245}" '
+        f'stroke="#cbd5e1" stroke-width="1.5" stroke-dasharray="4 3"/>'
+        f'<text x="{zero_x}" y="{vote_y + 262}" text-anchor="middle" font-size="12" '
+        f'fill="#64748b">0 分线</text>'
+    )
+    step5 = (
+        _arrow(1080, "arrow4")
+        + f'<text x="{vote_x + vote_w // 2}" y="{vote_y + 30}" text-anchor="middle" '
+        f'font-size="15" font-weight="700" fill="#334155">⑤ 全连接层投票打分</text>'
+        + f'<text x="{vote_x + vote_w // 2}" y="{vote_y + 48}" text-anchor="middle" '
+        f'font-size="12" fill="#64748b">得分 = 每个特征 × 权重 加总（正 = 支持，负 = 反对）</text>'
+        + "".join(bars)
+    )
+
+    # 第 6 步：输出层
     out_nodes = []
     for i in range(10):
         cx = out_x + 50
@@ -218,140 +285,114 @@ def build_cnn_html(cnn, tensor):
         f'<text x="{out_x + out_w // 2}" y="{out_y + 278}" text-anchor="middle" '
         f'font-size="12" fill="#64748b">软归一化：分数 → 概率</text>'
     )
+    step6 = "".join(out_nodes)
 
-    # ---------- 第二行：投票打分面板 ----------
-    vote_x, vote_y, vote_w, vote_h = 30, 400, 760, 270
-    max_abs = max(float(np.abs(logits).max()), 1e-6)
-    bar_max_w = 300
-    zero_x = vote_x + 300
-    bars = []
-    for i in range(10):
-        s = float(logits[i])
-        w = abs(s) / max_abs * bar_max_w
-        cy = vote_y + 52 + i * 21
-        is_top = i == top1
-        if s >= 0:
-            x0, origin = zero_x, "0% 50%"
-            color = "#2563eb" if is_top else "#93c5fd"
-        else:
-            x0, origin = zero_x - w, "100% 50%"
-            color = "#94a3b8"
-        bars.append(
-            f'<text x="{vote_x + 30}" y="{cy + 4}" text-anchor="middle" font-size="12" '
-            f'font-weight="bold" fill="{("#1d4ed8" if is_top else "#475569")}">{i}</text>'
-            f'<rect x="{x0:.1f}" y="{cy - 8}" width="{w:.1f}" height="16" rx="4" '
-            f'fill="{color}" class="score-bar" '
-            f'style="animation-delay:-2.35s;transform-box:fill-box;transform-origin:{origin}"/>'
-            f'<text x="{x0 + (8 if s >= 0 else -8)}" y="{cy + 4}" font-size="11" '
-            f'font-family="Consolas,monospace" fill="#475569" text-anchor="'
-            f'{("start" if s >= 0 else "end")}" class="score-label">{s:+.2f}</text>'
-        )
-    bars.append(
-        f'<line x1="{zero_x}" y1="{vote_y + 40}" x2="{zero_x}" y2="{vote_y + 245}" '
-        f'stroke="#cbd5e1" stroke-width="1.5" stroke-dasharray="4 3"/>'
-        f'<text x="{zero_x}" y="{vote_y + 262}" text-anchor="middle" font-size="12" '
-        f'fill="#64748b">0 分线</text>'
-    )
-    vote_title = (
-        f'<text x="{vote_x + vote_w // 2}" y="{vote_y + 30}" text-anchor="middle" '
-        f'font-size="15" font-weight="700" fill="#334155">⑤ 全连接层投票打分</text>'
-        f'<text x="{vote_x + vote_w // 2}" y="{vote_y + 48}" text-anchor="middle" '
-        f'font-size="12" fill="#64748b">得分 = 每个特征 × 权重 加总（正 = 支持，负 = 反对）</text>'
-    )
-
-    # ---------- 第二行：Grad-CAM 为什么面板 ----------
-    cam_x, cam_y, cam_w, cam_h = 820, 400, 650, 270
-    cam_img = (
-        f'<image href="{uri_cam}" x="{cam_x + 30}" y="{cam_y + 55}" '
-        f'width="200" height="200" class="grad-img"/>'
-        f'<text x="{cam_x + 130}" y="{cam_y + 275}" text-anchor="middle" '
-        f'font-size="12" fill="#64748b">红/黄越亮 = 模型越看重这块</text>'
-    )
-    cam_text = (
-        f'<text x="{cam_x + 260}" y="{cam_y + 80}" font-size="14" fill="#334155">'
-        f'🎯 模型认为这是 {top1}，因为：</text>'
-        f'<text x="{cam_x + 260}" y="{cam_y + 108}" font-size="13" fill="#475569">'
-        f'它把判断依据“映射”回原图，</text>'
-        f'<text x="{cam_x + 260}" y="{cam_y + 130}" font-size="13" fill="#475569">'
-        f'亮的地方就是它重点看的区域。</text>'
-        f'<text x="{cam_x + 260}" y="{cam_y + 162}" font-size="12" fill="#64748b">'
-        f'（专业叫法：Grad-CAM 热力图）</text>'
-    )
-    cam_title = (
+    # 第 7 步：Grad-CAM 证据图
+    step7 = (
         f'<text x="{cam_x + cam_w // 2}" y="{cam_y + 30}" text-anchor="middle" '
         f'font-size="15" font-weight="700" fill="#b45309">为什么判断是 {top1}（证据图）</text>'
+        + f'<image href="{assets["uri_cam"]}" x="{cam_x + 30}" y="{cam_y + 55}" '
+        f'width="200" height="200" class="grad-img"/>'
+        + f'<text x="{cam_x + 130}" y="{cam_y + 275}" text-anchor="middle" '
+        f'font-size="12" fill="#64748b">红/黄越亮 = 模型越看重这块</text>'
+        + f'<text x="{cam_x + 260}" y="{cam_y + 80}" font-size="14" fill="#334155">'
+        f'🎯 模型认为这是 {top1}，因为：</text>'
+        + f'<text x="{cam_x + 260}" y="{cam_y + 108}" font-size="13" fill="#475569">'
+        f'它把判断依据“映射”回原图，</text>'
+        + f'<text x="{cam_x + 260}" y="{cam_y + 130}" font-size="13" fill="#475569">'
+        f'亮的地方就是它重点看的区域。</text>'
+        + f'<text x="{cam_x + 260}" y="{cam_y + 162}" font-size="12" fill="#64748b">'
+        f'（专业叫法：Grad-CAM 热力图）</text>'
     )
 
-    # ---------- 底部流动指示 ----------
-    flow = (
-        '<text x="560" y="688" font-size="13" fill="#94a3b8">流程：</text>'
-        '<circle cx="620" cy="683" r="7" fill="#334155" class="flow1"/>'
-        '<text x="620" y="671" font-size="11" fill="#475569">看</text>'
-        '<circle cx="675" cy="683" r="7" fill="#ef4444" class="flow2"/>'
-        '<text x="675" y="671" font-size="11" fill="#475569">找模板</text>'
-        '<circle cx="730" cy="683" r="7" fill="#ef4444" class="flow3"/>'
-        '<text x="730" y="671" font-size="11" fill="#475569">组合</text>'
-        '<circle cx="785" cy="683" r="7" fill="#ef4444" class="flow4"/>'
-        '<text x="785" y="671" font-size="11" fill="#475569">压缩</text>'
-        '<circle cx="840" cy="683" r="7" fill="#f59e0b" class="flow5"/>'
-        '<text x="840" y="671" font-size="11" fill="#475569">投票</text>'
-        '<circle cx="895" cy="683" r="7" fill="#2563eb" class="flow6"/>'
-        '<text x="895" y="671" font-size="11" fill="#475569">出结果</text>'
-        '<text x="1010" y="688" font-size="12" fill="#94a3b8">看 → 找模板 → 组合 → 压缩 → 投票 → 出结果</text>'
-    )
-
-    css = """
-    <style>
-      .netviz-svg { width: 100%; height: auto; display: block; }
-      @keyframes inK   { 0%,100% { opacity:.5 } 5%  { opacity:1 } 18% { opacity:.65 } }
-      @keyframes arK   { 0%,100% { opacity:.12 } 14% { opacity:.9 } 30% { opacity:.2 } }
-      @keyframes fmK   { 0%,100% { opacity:.15 } 26% { opacity:1 } 45% { opacity:.5 } }
-      @keyframes barK  { 0%,55% { transform:scaleX(0); opacity:.2 } 62% { transform:scaleX(1); opacity:1 }
-                         85% { transform:scaleX(1); opacity:1 } 100% { transform:scaleX(0); opacity:.2 } }
-      @keyframes outK  { 0%,100% { opacity:.45 } 72% { opacity:1 } 90% { opacity:.6 } }
-      @keyframes outL  { 0%,68% { opacity:0 } 76% { opacity:1 } 100% { opacity:1 } }
-      @keyframes gradK { 0%,60% { opacity:0 } 70% { opacity:1 } 100% { opacity:1 } }
-      @keyframes flowK { 0%,100% { opacity:.2 } 35% { opacity:1 } }
-      .in-img   { animation: inK   4.2s infinite; animation-delay:-.15s; }
-      .arrow1   { animation: arK   4.2s infinite; animation-delay:-.5s; }
-      .fm1      { animation: fmK   4.2s infinite; animation-delay:-.7s; }
-      .arrow2   { animation: arK   4.2s infinite; animation-delay:-1.05s; }
-      .fm2      { animation: fmK   4.2s infinite; animation-delay:-1.25s; }
-      .arrow3   { animation: arK   4.2s infinite; animation-delay:-1.6s; }
-      .fm3      { animation: fmK   4.2s infinite; animation-delay:-1.8s; }
-      .arrow4   { animation: arK   4.2s infinite; animation-delay:-2.15s; }
-      .score-bar{ animation: barK  4.2s infinite; }
-      .score-label{ animation: outL 4.2s infinite; animation-delay:-2.55s; }
-      .out-node { animation: outK  4.2s infinite; }
-      .out-label{ animation: outL  4.2s infinite; animation-delay:-3.2s; }
-      .grad-img { animation: gradK 4.2s infinite; animation-delay:-2.75s; }
-      .flow1    { animation: flowK 4.2s infinite; animation-delay:-.2s; }
-      .flow2    { animation: flowK 4.2s infinite; animation-delay:-.9s; }
-      .flow3    { animation: flowK 4.2s infinite; animation-delay:-1.6s; }
-      .flow4    { animation: flowK 4.2s infinite; animation-delay:-2.3s; }
-      .flow5    { animation: flowK 4.2s infinite; animation-delay:-2.95s; }
-      .flow6    { animation: flowK 4.2s infinite; animation-delay:-3.5s; }
-    </style>
-    """
+    # 底部流动指示（仅自动循环模式显示）
+    flow = ""
+    if step is None and not for_viewer:
+        flow = (
+            '<text x="560" y="688" font-size="13" fill="#94a3b8">流程：</text>'
+            '<circle cx="620" cy="683" r="7" fill="#334155" class="flow1"/>'
+            '<text x="620" y="671" font-size="11" fill="#475569">看</text>'
+            '<circle cx="675" cy="683" r="7" fill="#ef4444" class="flow2"/>'
+            '<text x="675" y="671" font-size="11" fill="#475569">找模板</text>'
+            '<circle cx="730" cy="683" r="7" fill="#ef4444" class="flow3"/>'
+            '<text x="730" y="671" font-size="11" fill="#475569">组合</text>'
+            '<circle cx="785" cy="683" r="7" fill="#ef4444" class="flow4"/>'
+            '<text x="785" y="671" font-size="11" fill="#475569">压缩</text>'
+            '<circle cx="840" cy="683" r="7" fill="#f59e0b" class="flow5"/>'
+            '<text x="840" y="671" font-size="11" fill="#475569">投票</text>'
+            '<circle cx="895" cy="683" r="7" fill="#2563eb" class="flow6"/>'
+            '<text x="895" y="671" font-size="11" fill="#475569">出结果</text>'
+            '<text x="1010" y="688" font-size="12" fill="#94a3b8">'
+            "看 → 找模板 → 组合 → 压缩 → 投票 → 出结果</text>"
+        )
 
     svg = (
-        f'<svg class="netviz-svg" viewBox="0 0 1500 700" '
+        f'<svg class="{svg_class}" viewBox="0 0 1500 700" '
         f'xmlns="http://www.w3.org/2000/svg">'
         + "".join(panels)
-        + "".join(arrows)
-        + input_img
-        + stages
-        + "".join(out_nodes)
-        + vote_title
-        + "".join(bars)
-        + cam_title
-        + cam_img
-        + cam_text
         + "".join(titles)
+        + g(1, step1)
+        + g(2, step2)
+        + g(3, step3)
+        + g(4, step4)
+        + g(5, step5)
+        + g(6, step6)
+        + g(7, step7)
         + flow
         + "</svg>"
     )
-    return f"<div style='width:100%;'>{css}{svg}</div>"
+    return svg
+
+
+# ---------- 页面内嵌版 ----------
+
+
+PAGE_CSS = """
+<style>
+  @keyframes inK   { 0%,100% { opacity:.5 } 5%  { opacity:1 } 18% { opacity:.65 } }
+  @keyframes arK   { 0%,100% { opacity:.12 } 14% { opacity:.9 } 30% { opacity:.2 } }
+  @keyframes fmK   { 0%,100% { opacity:.15 } 26% { opacity:1 } 45% { opacity:.5 } }
+  @keyframes barK  { 0%,55% { transform:scaleX(0); opacity:.2 } 62% { transform:scaleX(1); opacity:1 }
+                     85% { transform:scaleX(1); opacity:1 } 100% { transform:scaleX(0); opacity:.2 } }
+  @keyframes outK  { 0%,100% { opacity:.45 } 72% { opacity:1 } 90% { opacity:.6 } }
+  @keyframes outL  { 0%,68% { opacity:0 } 76% { opacity:1 } 100% { opacity:1 } }
+  @keyframes gradK { 0%,60% { opacity:0 } 70% { opacity:1 } 100% { opacity:1 } }
+  @keyframes flowK { 0%,100% { opacity:.2 } 35% { opacity:1 } }
+  .in-img   { animation: inK   4.2s infinite; animation-delay:-.15s; }
+  .arrow1   { animation: arK   4.2s infinite; animation-delay:-.5s; }
+  .fm1      { animation: fmK   4.2s infinite; animation-delay:-.7s; }
+  .arrow2   { animation: arK   4.2s infinite; animation-delay:-1.05s; }
+  .fm2      { animation: fmK   4.2s infinite; animation-delay:-1.25s; }
+  .arrow3   { animation: arK   4.2s infinite; animation-delay:-1.6s; }
+  .fm3      { animation: fmK   4.2s infinite; animation-delay:-1.8s; }
+  .arrow4   { animation: arK   4.2s infinite; animation-delay:-2.15s; }
+  .score-bar{ animation: barK  4.2s infinite; }
+  .score-label{ animation: outL 4.2s infinite; animation-delay:-2.55s; }
+  .out-node { animation: outK  4.2s infinite; }
+  .out-label{ animation: outL  4.2s infinite; animation-delay:-3.2s; }
+  .grad-img { animation: gradK 4.2s infinite; animation-delay:-2.75s; }
+  .flow1    { animation: flowK 4.2s infinite; animation-delay:-.2s; }
+  .flow2    { animation: flowK 4.2s infinite; animation-delay:-.9s; }
+  .flow3    { animation: flowK 4.2s infinite; animation-delay:-1.6s; }
+  .flow4    { animation: flowK 4.2s infinite; animation-delay:-2.3s; }
+  .flow5    { animation: flowK 4.2s infinite; animation-delay:-2.95s; }
+  .flow6    { animation: flowK 4.2s infinite; animation-delay:-3.5s; }
+  .step-mode * { animation: none !important; }
+</style>
+"""
+
+
+def build_cnn_html(cnn, tensor, step=None):
+    """页面内嵌可视化。step 为 None 时自动循环；为 1~7 时只显示到第 n 步。"""
+    assets = _compute_features(cnn, tensor)
+    svg_class = "netviz-svg" + (" step-mode" if step is not None else "")
+    svg = _build_svg(assets, step=step, svg_class=svg_class)
+    return (
+        "<div style='width:100%;'>"
+        + PAGE_CSS
+        + svg
+        + "</div>"
+    )
 
 
 def build_empty_html():
@@ -366,9 +407,107 @@ def build_empty_html():
     )
 
 
+# ---------- 独立大图分步版 ----------
+
+
+VIEWER_DESCS = [
+    "① 输入：这是你写的数字。对电脑来说，它只是 784 个数字组成的表格。",
+    "② 找小模板：卷积层拿 32 个“小模板”在图上滑动，特征图越亮的地方 = 越像这个模板。",
+    "③ 组合成笔画：第二层把第一层找到的碎片组合成“横、竖、圈”等更大的笔画。",
+    "④ 压缩：池化只保留最明显的特征，记住“哪里有”，不记“精确在哪”。",
+    "⑤ 投票打分：全连接层把每个特征乘以权重再加起来，0~9 各得一个分（正分支持、负分反对）。",
+    "⑥ 出结果：分数转成概率，最高分胜出 —— 模型认为这是这个数字。",
+    "⑦ 证据图：把“为什么”映射回原图，红/黄越亮的地方就是模型重点看的区域。",
+]
+
+
+def build_viewer_html(cnn, tensor):
+    """生成独立的大图分步演示 HTML（可上一步/下一步/自动播放/缩放）。"""
+    assets = _compute_features(cnn, tensor)
+    svg = _build_svg(assets, step=None, for_viewer=True)
+    top1 = assets["top1"]
+    descs_js = "[" + ",".join(f'"{d}"' for d in VIEWER_DESCS) + "]"
+
+    return f"""<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>CNN 分步演示 · 手写数字识别</title>
+<style>
+  body {{ margin:0; background:linear-gradient(160deg,#eef2ff,#f8fafc); font-family:"Microsoft YaHei","PingFang SC",system-ui,sans-serif; }}
+  .topbar {{ background:linear-gradient(120deg,#1e3a8a,#2563eb 55%,#3b82f6); color:#fff; padding:16px 24px; font-size:18px; font-weight:700; }}
+  .toolbar {{ display:flex; align-items:center; gap:10px; flex-wrap:wrap; padding:12px 24px; background:#fff; border-bottom:1px solid #e2e8f0; }}
+  .toolbar button {{ border:1px solid #cbd5e1; background:#fff; color:#334155; border-radius:10px; padding:8px 16px; font-size:14px; cursor:pointer; }}
+  .toolbar button:hover {{ background:#eff6ff; }}
+  .toolbar button.primary {{ background:#2563eb; border-color:#2563eb; color:#fff; }}
+  .toolbar button.active {{ background:#2563eb; border-color:#2563eb; color:#fff; }}
+  #stepper {{ display:flex; gap:6px; flex-wrap:wrap; }}
+  #stepper .sbtn {{ padding:6px 12px; font-size:13px; border-radius:999px; }}
+  #wrap {{ width:100%; }}
+  #wrap svg {{ width:100%; height:auto; display:block; }}
+  #desc {{ padding:14px 24px 20px; color:#334155; font-size:15px; line-height:1.8; min-height:60px; }}
+  #desc b {{ color:#1d4ed8; }}
+  .hint {{ color:#94a3b8; font-size:12px; padding:0 24px 10px; }}
+</style>
+</head>
+<body>
+<div class="topbar">🧠 CNN 是怎么算出来的 · 分步演示（点击“下一步”逐步查看）</div>
+<div class="toolbar">
+  <button id="prev">⬅ 上一步</button>
+  <button id="next" class="primary">下一步 ➡</button>
+  <button id="auto">▶ 自动播放</button>
+  <button id="zoomIn">🔍 放大</button>
+  <button id="zoomOut">🔍 缩小</button>
+  <div id="stepper"></div>
+</div>
+<div class="hint">当前数字：<b>{top1}</b>（识别结果）· 灰色部分 = 还没执行到的步骤</div>
+<div id="wrap">{svg}</div>
+<div id="desc">{VIEWER_DESCS[0]}</div>
+<script>
+const DESCS = {descs_js};
+const groups = Array.from(document.querySelectorAll("[data-step]"));
+const stepper = document.getElementById("stepper");
+const STEPS = groups.length;
+let cur = 1;
+let timer = null;
+
+for (let i = 1; i <= STEPS; i++) {{
+  const b = document.createElement("button");
+  b.className = "sbtn";
+  b.textContent = ["①","②","③","④","⑤","⑥","⑦"][i-1] || i;
+  b.onclick = () => {{ cur = i; render(); }};
+  stepper.appendChild(b);
+}}
+
+function render() {{
+  groups.forEach(g => {{
+    g.style.opacity = Number(g.dataset.step) <= cur ? 1 : 0;
+  }});
+  Array.from(stepper.children).forEach((b, i) => b.classList.toggle("active", i + 1 === cur));
+  document.getElementById("desc").innerHTML = DESCS[cur - 1];
+}}
+
+document.getElementById("next").onclick = () => {{ cur = Math.min(STEPS, cur + 1); render(); }};
+document.getElementById("prev").onclick = () => {{ cur = Math.max(1, cur - 1); render(); }};
+document.getElementById("auto").onclick = () => {{
+  if (timer) {{ clearInterval(timer); timer = null; document.getElementById("auto").textContent = "▶ 自动播放"; return; }}
+  document.getElementById("auto").textContent = "⏸ 暂停";
+  timer = setInterval(() => {{ cur = cur >= STEPS ? 1 : cur + 1; render(); }}, 1800);
+}};
+
+let zoom = 100;
+document.getElementById("zoomIn").onclick = () => {{ zoom = Math.min(180, zoom + 20); document.getElementById("wrap").style.width = zoom + "%"; }};
+document.getElementById("zoomOut").onclick = () => {{ zoom = Math.max(60, zoom - 20); document.getElementById("wrap").style.width = zoom + "%"; }};
+
+render();
+</script>
+</body>
+</html>"""
+
+
 def save_preview(cnn, tensor, path):
-    """把一次计算的动画存成独立 HTML，方便直接在浏览器里预览。"""
     from pathlib import Path
 
-    Path(path).write_text(build_cnn_html(cnn, tensor), encoding="utf-8")
+    Path(path).write_text(build_viewer_html(cnn, tensor), encoding="utf-8")
     return path

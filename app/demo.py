@@ -26,7 +26,7 @@ import gradio as gr
 from PIL import Image
 
 from src.model import build_model
-from src.network_viz import build_cnn_html, build_empty_html
+from src.network_viz import build_cnn_html, build_empty_html, build_viewer_html
 from src.preprocess import preprocess_digit
 
 
@@ -288,15 +288,43 @@ def main():
         "写完之后，这里会显示 0~9 每个数字的概率</div>"
     )
 
+    # 记住最近一次识别，供“分步查看”按钮使用
+    state = {"tensor": None, "link": ""}
+
+    def write_viewer(tensor):
+        """把当前数字的独立分步演示页写到文件，并生成“放大”链接。"""
+        viewer_path = ROOT / "outputs" / "net_viewer.html"
+        viewer_path.write_text(build_viewer_html(viz_model, tensor), encoding="utf-8")
+        state["tensor"] = tensor
+        state["link"] = (
+            f'<a href="{viewer_path.as_uri()}" target="_blank" '
+            'style="font-size:14px;color:#2563eb;font-weight:600;'
+            'text-decoration:none;border:1px solid #bfdbfe;'
+            'border-radius:10px;padding:6px 12px;display:inline-block;'
+            'background:#eff6ff;">🔍 放大 · 分步演示（新窗口）</a>'
+        )
+
     def handle(img):
         top, bars, msg, canvas = predict(model, img)
         _, _, tensor = classify(model, img)
-        viz = (
-            build_cnn_html(viz_model, tensor)
-            if tensor is not None
-            else build_empty_html()
-        )
-        return top, bars, msg, canvas, viz
+        if tensor is not None:
+            viz = build_cnn_html(viz_model, tensor)
+            write_viewer(tensor)
+        else:
+            viz = build_empty_html()
+            state["tensor"] = None
+            state["link"] = ""
+        return top, bars, msg, canvas, viz, state["link"]
+
+    def show_step(step):
+        if state["tensor"] is None:
+            return build_empty_html(), state["link"]
+        return build_cnn_html(viz_model, state["tensor"], step=step), state["link"]
+
+    def show_auto():
+        if state["tensor"] is None:
+            return build_empty_html(), state["link"]
+        return build_cnn_html(viz_model, state["tensor"]), state["link"]
 
     def random_example():
         return gr.update(value=random.choice(example_paths))
@@ -313,6 +341,7 @@ def main():
                 "",
                 None,
                 build_empty_html(),
+                state["link"],
             )
         top1 = int(probs.argmax())
         conf = float(probs[top1])
@@ -324,6 +353,7 @@ def main():
                 "这就是模型的盲区：训练数据里长得像 "
                 f"{top1} 的 {true_label}，模型就学会了这种对应。"
             )
+        write_viewer(tensor)
         return (
             gr.update(value=path),
             render_top(top1, conf),
@@ -331,6 +361,7 @@ def main():
             reveal,
             (canvas * 255).astype(np.uint8),
             build_cnn_html(viz_model, tensor),
+            state["link"],
         )
 
     gradio_major = int(gr.__version__.split(".")[0])
@@ -394,15 +425,39 @@ def main():
 
         # 计算过程动画
         with gr.Column(elem_classes=["card"]):
+            with gr.Row():
+                gr.Markdown(
+                    "### 🧠 CNN 是怎么算出来的（小白版动画）",
+                    elem_classes=["section-title"],
+                )
+                viewer_link = gr.HTML("")
             gr.Markdown(
-                "### 🧠 CNN 是怎么算出来的（小白版动画）\n"
                 "完整流程：**看 → 找模板 → 组合 → 压缩 → 投票打分 → 出结果**。"
                 "输入 28×28 → 卷积层 1（32 张特征图）→ 卷积层 2（64 张）→ 池化"
                 "（64 张 7×7）→ **全连接层给 0~9 各打一个分**（正分支持、负分反对）"
-                "→ 输出概率。最下面的“为什么判断是 X”证据图，用高亮标出模型重点看的区域。",
-                elem_classes=["section-title"],
+                "→ 输出概率。最下面的“为什么判断是 X”证据图，用高亮标出模型重点看的区域。"
+                "也可以点下面的步骤按钮，一步一步看。"
             )
             net_html = gr.HTML(build_empty_html())
+            with gr.Row():
+                step_labels = [
+                    "① 输入",
+                    "② 找模板",
+                    "③ 组合",
+                    "④ 压缩",
+                    "⑤ 投票",
+                    "⑥ 结果",
+                    "⑦ 证据",
+                ]
+                for idx, label in enumerate(step_labels, 1):
+                    gr.Button(label, size="sm", variant="secondary").click(
+                        fn=lambda s=idx: show_step(s),
+                        outputs=[net_html, viewer_link],
+                    )
+                gr.Button("▶ 自动演示", size="sm", variant="primary").click(
+                    fn=show_auto,
+                    outputs=[net_html, viewer_link],
+                )
 
         # 样本库：示例 + 挑战题
         with gr.Tabs():
@@ -443,6 +498,7 @@ def main():
                                             msg,
                                             small_img,
                                             net_html,
+                                            viewer_link,
                                         ],
                                     )
 
@@ -456,17 +512,17 @@ def main():
         sketch.input(
             fn=handle,
             inputs=sketch,
-            outputs=[top_html, bars_html, msg, small_img, net_html],
+            outputs=[top_html, bars_html, msg, small_img, net_html, viewer_link],
         )
         btn_random.click(random_example, outputs=sketch).then(
             fn=handle,
             inputs=sketch,
-            outputs=[top_html, bars_html, msg, small_img, net_html],
+            outputs=[top_html, bars_html, msg, small_img, net_html, viewer_link],
         )
         btn_go.click(
             fn=handle,
             inputs=sketch,
-            outputs=[top_html, bars_html, msg, small_img, net_html],
+            outputs=[top_html, bars_html, msg, small_img, net_html, viewer_link],
         )
 
     # 预启动处理队列 + 预热，避免第一次手写"没反应"

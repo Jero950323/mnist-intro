@@ -5,3 +5,4 @@ __pycache__/
 .idea/
 data/
 outputs/*.pth
+outputs/net_viewer.html

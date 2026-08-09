@@ -27,7 +27,7 @@ import gradio as gr
 from PIL import Image
 
 from src.model import build_model
-from src.network_viz import build_empty_html, build_network_html
+from src.network_viz import build_cnn_html, build_empty_html
 from src.preprocess import preprocess_digit
 
 
@@ -229,7 +229,8 @@ def main():
     args = parser.parse_args()
 
     model = load_model(args.model, args.checkpoint)
-    mlp_model = load_model("mlp", "outputs/mlp_mnist.pth")
+    # 可视化用实际使用的 CNN（如果主模型不是 CNN，就单独加载 CNN 模型）
+    viz_model = model if args.model == "cnn" else load_model("cnn", "outputs/cnn_mnist.pth")
 
     example_paths = [
         str(p) for p in sorted((ROOT / "outputs" / "examples").glob("digit_*.png"))
@@ -249,7 +250,7 @@ def main():
         top, bars, msg, canvas = predict(model, img)
         _, _, tensor = classify(model, img)
         viz = (
-            build_network_html(mlp_model, tensor)
+            build_cnn_html(viz_model, tensor)
             if tensor is not None
             else build_empty_html()
         )
@@ -287,7 +288,7 @@ def main():
             render_bars(probs),
             reveal,
             (canvas * 255).astype(np.uint8),
-            build_network_html(mlp_model, tensor),
+            build_cnn_html(viz_model, tensor),
         )
 
     # Gradio 6 把 css/theme 参数移到了 launch()，这里做版本兼容
@@ -339,12 +340,11 @@ def main():
 
         with gr.Column(elem_classes=["result-card"]):
             gr.Markdown(
-                "### 🔍 神经网络内部是怎么算的\n"
-                "左边是输入图片，中间是隐藏层 **128 个神经元**的实时激活值"
-                "（越亮 = 被激活得越强），右边是 **0~9 共 10 个输出节点**的概率。"
-                "这里用结构透明的 MLP 做演示；页面识别用的仍是更准的 CNN。"
-                "动画会循环流动：输入像素点亮 → 连接线脉冲 → 隐藏层神经元点亮 → "
-                "连接线脉冲 → 输出层节点给出概率。"
+                "### 🔍 CNN 是怎么“看”的（特征图动画）\n"
+                "图片从左到右流过真实网络：输入 28×28 → **卷积层 1**（32 张特征图）→ "
+                "**卷积层 2**（64 张）→ **池化后**（64 张 7×7）→ **输出层 0~9 共 10 个节点**"
+                "给出概率。特征图是模型真实的中间计算结果，越亮表示对“边缘、笔画”等"
+                "模式的响应越强，动画会循环流动。"
             )
             net_html = gr.HTML(build_empty_html())
 

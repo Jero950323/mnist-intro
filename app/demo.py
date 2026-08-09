@@ -1,9 +1,9 @@
-"""Gradio 交互演示：用鼠标手写数字，模型实时识别。
+"""手写数字识别演示（产品化页面）。
 
 用法（在项目根目录）:
     python app/demo.py
     或
-    python app/demo.py --share    # 生成公网链接，方便远程演示
+    python app/demo.py --share
 """
 
 import argparse
@@ -14,7 +14,6 @@ import subprocess
 import sys
 from pathlib import Path
 
-# 限制数值库线程数，避免低内存机器上 OpenBLAS 分配失败
 os.environ.setdefault("OPENBLAS_NUM_THREADS", "2")
 os.environ.setdefault("OMP_NUM_THREADS", "2")
 
@@ -50,78 +49,67 @@ def load_model(model_name, checkpoint):
     return model
 
 
-# ---------- 图像预处理 ----------
-
-
-# ---------- 页面渲染 ----------
-
-
-def render_bars(probs):
-    """把 10 个数字的概率渲染成横向条形图（HTML）。"""
-    order = np.argsort(probs)[::-1]
-    items = []
-    for rank, idx in enumerate(order):
-        p = probs[idx]
-        width = max(2.0, p * 100)
-        bar_color = "#2563eb" if rank == 0 else "#b6ccf7"
-        text_color = "#111827" if rank == 0 else "#6b7280"
-        items.append(
-            f"""
-            <div style="display:flex;align-items:center;gap:10px;margin:5px 0;">
-              <span style="width:22px;font-weight:700;color:{text_color};text-align:center;">{idx}</span>
-              <div style="flex:1;background:#eef2f7;border-radius:8px;height:20px;overflow:hidden;">
-                <div style="width:{width:.1f}%;height:100%;background:{bar_color};border-radius:8px;transition:width .15s;"></div>
-              </div>
-              <span style="width:54px;text-align:right;font-family:Consolas,monospace;color:{text_color};">{p*100:.1f}%</span>
-            </div>
-            """
-        )
-    return (
-        "<div style='font-family:system-ui,-apple-system,sans-serif;'>"
-        + "".join(items)
-        + "</div>"
-    )
-
-
-def render_top(top1, conf):
-    return f"""
-    <div style="text-align:center;padding:6px 0;">
-      <div style="font-size:16px;color:#64748b;font-weight:600;">识别结果</div>
-      <div style="font-size:76px;font-weight:800;color:#1d4ed8;line-height:1.15;">{top1}</div>
-      <div style="font-size:15px;color:#475569;">置信度 {conf:.1%}</div>
-    </div>
-    """
+# ---------- 识别 ----------
 
 
 def classify(model, img):
-    """把画板输入转成 28x28 并预测，返回 (probs, canvas, tensor)。
-
-    输入为空时返回 (None, None, None)。probs 是 10 个数字的概率，
-    canvas 是 0~1 的 28x28 灰度图（页面展示“模型看到的样子”）。
-    """
+    """把画板输入转成 28x28 并预测，返回 (probs, canvas, tensor)。"""
     if img is None:
         return None, None, None
-
-    # Gradio 6 的 Sketchpad 会传入 dict（background/layers/composite），
-    # 旧版本则直接传 numpy 数组，这里兼容两种格式
     if isinstance(img, dict):
         composite = img.get("composite")
         img = composite if composite is not None else img.get("background")
     if img is None:
         return None, None, None
-
     result = preprocess_digit(img)
     if result is None:
         return None, None, None
-
     tensor, canvas = result
     with torch.no_grad():
         probs = torch.softmax(model(tensor), dim=1)[0].numpy()
     return probs, canvas, tensor
 
 
+def render_bars(probs):
+    """0~9 概率条形图（HTML）。"""
+    order = np.argsort(probs)[::-1]
+    items = []
+    for rank, idx in enumerate(order):
+        p = probs[idx]
+        w = max(2.0, p * 100)
+        top = rank == 0
+        color = "#2563eb" if top else "#b6ccf7"
+        label_color = "#1d4ed8" if top else "#64748b"
+        items.append(
+            f"""
+            <div class="prob-row">
+              <span class="prob-label" style="color:{label_color}">{idx}</span>
+              <div class="prob-track">
+                <div class="prob-fill" style="width:{w:.1f}%;background:{color}"></div>
+              </div>
+              <span class="prob-val" style="color:{label_color}">{p*100:.1f}%</span>
+            </div>
+            """
+        )
+    return "<div>" + "".join(items) + "</div>"
+
+
+def render_top(top1, conf):
+    """顶部大字结果 + 置信度徽章。"""
+    level = "conf-high" if conf >= 0.9 else ("conf-mid" if conf >= 0.6 else "conf-low")
+    return f"""
+    <div class="result-hero">
+      <div class="result-label">识别结果</div>
+      <div class="result-digit">{top1}</div>
+      <div class="result-conf">
+        <span class="conf-badge {level}">置信度 {conf:.1%}</span>
+      </div>
+    </div>
+    """
+
+
 def predict(model, img):
-    """把画板上的图像转成 28x28，交给模型预测，返回页面组件需要的内容。"""
+    """把画板图像转成 28x28 并预测，返回页面组件需要的内容。"""
     empty_top = (
         "<div style='text-align:center;color:#94a3b8;font-size:18px;padding:30px 0;'>"
         "请先在画板上写一个数字</div>"
@@ -134,7 +122,6 @@ def predict(model, img):
         return empty_top, empty_bars, "", None
     probs, canvas, _ = classify(model, img)
     if probs is None:
-        # 画板有事件但没拿到有效笔画（例如第一次落笔画板还没初始化）
         return (
             "<div style='text-align:center;color:#f59e0b;font-size:16px;padding:30px 0;'>"
             "没有识别到笔画，请再写一次，或点击左侧「🔍 识别」按钮</div>",
@@ -142,13 +129,12 @@ def predict(model, img):
             "",
             None,
         )
-
     top1 = int(probs.argmax())
     conf = float(probs[top1])
     msg = (
         f"识别结果：**{top1}**（置信度 {conf:.1%}）"
         "　提示：写大、写粗、写中间最准；"
-        f"{'当前置信度较低，可以重写一次试试。' if conf < 0.4 else '左侧的条形图是 0~9 每个数字的概率。'}"
+        f"{'当前置信度较低，可以重写一次试试。' if conf < 0.4 else '左侧条形图是 0~9 每个数字的概率。'}"
     )
     return (
         render_top(top1, conf),
@@ -177,11 +163,7 @@ def load_challenges(examples_dir):
 
 
 def build_sketchpad():
-    """创建手写画板组件，兼容不同版本的 Gradio。
-
-    Gradio 5 及之前用 shape/brush_radius；
-    Gradio 6 改成了 height/width + Brush 对象。
-    """
+    """创建手写画板组件，兼容不同版本的 Gradio。"""
     import inspect
 
     params = inspect.signature(gr.Sketchpad.__init__).parameters
@@ -191,7 +173,7 @@ def build_sketchpad():
             image_mode="L",
             invert_colors=True,
             brush_radius=26,
-            label="在这里用鼠标写一个 0~9 的数字",
+            label="",
         )
     return gr.Sketchpad(
         height=420,
@@ -199,33 +181,85 @@ def build_sketchpad():
         image_mode="L",
         canvas_size=(560, 560),
         brush=gr.Brush(default_size=26),
-        label="在这里用鼠标写一个 0~9 的数字",
+        label="",
     )
 
 
 CSS = """
 .gradio-container {
-  background: linear-gradient(135deg, #f6f8fc 0%, #eef2ff 100%);
-  max-width: 1120px !important;
+  background: linear-gradient(160deg, #eef2ff 0%, #f8fafc 45%, #f1f5f9 100%);
+  max-width: 1200px !important;
   margin: 0 auto;
+  font-family: "Microsoft YaHei", "PingFang SC", system-ui, sans-serif;
 }
-#app-header { text-align: center; padding: 10px 0 6px; }
-#app-header h1 { font-size: 28px; font-weight: 800; color: #1e293b; margin: 0; }
-#app-header p { color: #64748b; margin: 6px 0 0; font-size: 14px; }
-.draw-card, .result-card {
-  background: #ffffff;
+
+/* 品牌头部 */
+.app-header {
+  background: linear-gradient(120deg, #1e3a8a 0%, #2563eb 55%, #3b82f6 100%);
+  color: #fff;
   border-radius: 18px;
-  box-shadow: 0 6px 24px rgba(30, 64, 175, 0.08);
-  padding: 18px;
+  padding: 24px 30px;
+  margin-bottom: 18px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 12px;
+  box-shadow: 0 10px 30px rgba(37, 99, 235, 0.25);
 }
-.challenge-card {
-  background: #fffbeb;
-  border: 1px solid #fde68a;
-  border-radius: 18px;
-  box-shadow: 0 6px 24px rgba(180, 83, 9, 0.08);
-  padding: 14px 18px;
+.brand-name { font-size: 25px; font-weight: 800; letter-spacing: 1px; }
+.brand-sub { font-size: 14px; opacity: .85; margin-top: 4px; }
+.header-badges { display: flex; gap: 10px; flex-wrap: wrap; }
+.badge {
+  background: rgba(255,255,255,.16);
+  border: 1px solid rgba(255,255,255,.35);
+  border-radius: 999px;
+  padding: 6px 14px;
+  font-size: 13px;
 }
-#tips { color: #64748b; font-size: 13px; text-align: center; margin-top: 6px; }
+
+/* 卡片 */
+.card {
+  background: #fff;
+  border: 1px solid #e2e8f0;
+  border-radius: 16px;
+  box-shadow: 0 4px 18px rgba(15, 23, 42, .06);
+  padding: 20px 22px;
+}
+.section-title {
+  margin: 0 0 12px !important;
+  font-size: 16px !important;
+  color: #0f172a !important;
+}
+.tips {
+  color: #64748b;
+  font-size: 13px;
+  line-height: 1.7;
+  background: #f8fafc;
+  border-radius: 10px;
+  padding: 10px 14px;
+  margin-top: 12px;
+}
+
+/* 结果区 */
+.result-hero { text-align: center; padding: 8px 0 6px; }
+.result-label { font-size: 13px; color: #94a3b8; letter-spacing: 2px; font-weight: 600; }
+.result-digit { font-size: 84px; font-weight: 800; color: #1d4ed8; line-height: 1.15; }
+.result-conf { margin-top: 8px; }
+.conf-badge { display: inline-block; border-radius: 999px; padding: 5px 16px; font-size: 14px; font-weight: 600; }
+.conf-high { background: #dcfce7; color: #15803d; }
+.conf-mid  { background: #fef3c7; color: #b45309; }
+.conf-low  { background: #fee2e2; color: #b91c1c; }
+
+/* 概率条 */
+.prob-row { display: flex; align-items: center; gap: 10px; margin: 6px 0; }
+.prob-label { width: 22px; font-weight: 700; text-align: center; color: #475569; }
+.prob-track { flex: 1; background: #eef2f7; border-radius: 8px; height: 22px; overflow: hidden; }
+.prob-fill { height: 100%; border-radius: 8px; transition: width .18s ease; }
+.prob-val { width: 56px; text-align: right; font-family: Consolas, monospace; font-size: 13px; color: #475569; }
+
+/* 页脚 */
+.app-footer { text-align: center; color: #94a3b8; font-size: 13px; padding: 18px 0 8px; }
 footer { display: none !important; }
 """
 
@@ -238,7 +272,6 @@ def main():
     args = parser.parse_args()
 
     model = load_model(args.model, args.checkpoint)
-    # 可视化用实际使用的 CNN（如果主模型不是 CNN，就单独加载 CNN 模型）
     viz_model = model if args.model == "cnn" else load_model("cnn", "outputs/cnn_mnist.pth")
 
     example_paths = [
@@ -300,7 +333,6 @@ def main():
             build_cnn_html(viz_model, tensor),
         )
 
-    # Gradio 6 把 css/theme 参数移到了 launch()，这里做版本兼容
     gradio_major = int(gr.__version__.split(".")[0])
     blocks_kwargs = {"title": "手写数字识别 · 深度学习原理演示"}
     launch_kwargs = {"share": args.share}
@@ -310,94 +342,117 @@ def main():
         blocks_kwargs.update(css=CSS, theme=gr.themes.Soft(primary_hue="blue"))
 
     with gr.Blocks(**blocks_kwargs) as demo:
+        # 品牌头部
         gr.HTML(
             """
-            <div id="app-header">
-              <h1>✏️ 手写数字识别 · 深度学习原理演示</h1>
-              <p>用鼠标写一个 0~9 的数字，模型实时告诉你它认为是几 —— 全程本地运行，数据不会上传</p>
+            <div class="app-header">
+              <div>
+                <div class="brand-name">✏️ 手写数字识别</div>
+                <div class="brand-sub">用大白话看懂深度学习 · PyTorch 教学演示</div>
+              </div>
+              <div class="header-badges">
+                <span class="badge">CNN 准确率 98.95%</span>
+                <span class="badge">本地运行 · 数据不上传</span>
+                <span class="badge">识别过程可视化</span>
+              </div>
             </div>
             """
         )
 
+        # 主操作区：左画板 + 右结果
         with gr.Row(equal_height=False):
-            with gr.Column(scale=5, elem_classes=["draw-card"]):
+            with gr.Column(scale=5, elem_classes=["card"]):
+                gr.Markdown("### ✍️ 手写输入", elem_classes=["section-title"])
                 sketch = build_sketchpad()
                 with gr.Row():
                     btn_random = gr.Button("🎲 随机示例", variant="secondary")
                     btn_go = gr.Button("🔍 识别", variant="primary")
                 gr.Markdown(
                     "**提示**：写大、写粗、写中间最准；“1”直接画一根竖线。",
-                    elem_id="tips",
+                    elem_classes=["tips"],
                 )
 
-            with gr.Column(scale=4, elem_classes=["result-card"]):
-                top_html = gr.HTML(
-                    "<div style='text-align:center;color:#94a3b8;font-size:18px;"
-                    "padding:30px 0;'>请先在画板上写一个数字</div>"
-                )
-                bars_html = gr.HTML(
-                    "<div style='text-align:center;color:#94a3b8;padding:12px;'>"
-                    "写完之后，这里会显示 0~9 每个数字的概率</div>"
-                )
-                with gr.Row():
-                    small_img = gr.Image(
-                        label="模型看到的 28×28（预处理后）",
-                        height=170,
-                        width=170,
-                        interactive=False,
-                    )
+            with gr.Column(scale=4):
+                with gr.Column(elem_classes=["card"]):
+                    gr.Markdown("### 📊 识别结果", elem_classes=["section-title"])
+                    top_html = gr.HTML(empty_top)
+                    bars_html = gr.HTML(empty_bars)
                     msg = gr.Markdown("")
+                with gr.Column(elem_classes=["card"]):
+                    gr.Markdown("### 🔎 模型看到的输入", elem_classes=["section-title"])
+                    with gr.Row():
+                        small_img = gr.Image(
+                            height=170,
+                            width=170,
+                            interactive=False,
+                            show_label=False,
+                        )
+                        gr.Markdown(
+                            "这是模型**真正看到的 28×28**：图片 = 数字表格。\n\n"
+                            "写完后，这里会实时更新。"
+                        )
 
-        with gr.Column(elem_classes=["result-card"]):
+        # 计算过程动画
+        with gr.Column(elem_classes=["card"]):
             gr.Markdown(
-                "### 🔍 CNN 是怎么算出来的（小白版动画）\n"
+                "### 🧠 CNN 是怎么算出来的（小白版动画）\n"
                 "完整流程：**看 → 找模板 → 组合 → 压缩 → 投票打分 → 出结果**。"
                 "输入 28×28 → 卷积层 1（32 张特征图）→ 卷积层 2（64 张）→ 池化"
                 "（64 张 7×7）→ **全连接层给 0~9 各打一个分**（正分支持、负分反对）"
-                "→ 输出概率。最下面的“为什么判断是 X”证据图，用高亮标出模型重点看的区域"
-                "（专业叫法：Grad-CAM）。"
+                "→ 输出概率。最下面的“为什么判断是 X”证据图，用高亮标出模型重点看的区域。",
+                elem_classes=["section-title"],
             )
             net_html = gr.HTML(build_empty_html())
 
-        gr.Examples(
-            examples=[[p] for p in example_paths],
-            inputs=sketch,
-            label="示例（点一个试试）",
+        # 样本库：示例 + 挑战题
+        with gr.Tabs():
+            with gr.Tab("📁 示例（0~9）"):
+                gr.Examples(
+                    examples=[[p] for p in example_paths],
+                    inputs=sketch,
+                    label="点一张，自动填入画板并识别",
+                )
+            if challenges:
+                with gr.Tab("🧩 挑战题（模型的盲区）"):
+                    gr.Markdown(
+                        "先猜猜这些数字是几，再点「识别」。模型答错的题，最能说明"
+                        "**训练数据长什么样，模型就学什么样**。"
+                    )
+                    for i in range(0, len(challenges), 4):
+                        with gr.Row():
+                            for path, true_label in challenges[i : i + 4]:
+                                with gr.Column(min_width=110):
+                                    gr.Image(
+                                        value=path,
+                                        interactive=False,
+                                        show_label=False,
+                                        height=110,
+                                        width=110,
+                                    )
+                                    btn = gr.Button(
+                                        "识别", size="sm", variant="secondary"
+                                    )
+                                    btn.click(
+                                        fn=lambda p=path, t=true_label: on_challenge(
+                                            p, t
+                                        ),
+                                        outputs=[
+                                            sketch,
+                                            top_html,
+                                            bars_html,
+                                            msg,
+                                            small_img,
+                                            net_html,
+                                        ],
+                                    )
+
+        # 页脚
+        gr.HTML(
+            '<div class="app-footer">PyTorch · MNIST 教学项目 · '
+            "手写数字识别 —— 用大白话看懂深度学习</div>"
         )
 
-        if challenges:
-            with gr.Column(elem_classes=["challenge-card"]):
-                gr.Markdown(
-                    "### 🧠 挑战题：模型的盲区\n"
-                    "先猜猜这些数字是几，再点「识别」。模型答错的题，最能说明"
-                    "**训练数据长什么样，模型就学什么样**。"
-                )
-                for i in range(0, len(challenges), 6):
-                    with gr.Row():
-                        for path, true_label in challenges[i : i + 6]:
-                            with gr.Column(min_width=95):
-                                gr.Image(
-                                    value=path,
-                                    interactive=False,
-                                    show_label=False,
-                                    height=110,
-                                    width=110,
-                                )
-                                btn = gr.Button("识别", size="sm", variant="secondary")
-                                btn.click(
-                                    fn=lambda p=path, t=true_label: on_challenge(
-                                        p, t
-                                    ),
-                                    outputs=[
-                                        sketch,
-                                        top_html,
-                                        bars_html,
-                                        msg,
-                                        small_img,
-                                        net_html,
-                                    ],
-                                )
-
+        # 事件
         sketch.input(
             fn=handle,
             inputs=sketch,
@@ -408,17 +463,14 @@ def main():
             inputs=sketch,
             outputs=[top_html, bars_html, msg, small_img, net_html],
         )
-        # 兜底按钮：画完点击也能识别（第一次落笔事件偶尔不触发时用）
         btn_go.click(
             fn=handle,
             inputs=sketch,
             outputs=[top_html, bars_html, msg, small_img, net_html],
         )
 
-    # 预启动处理队列，避免第一次请求才启动、感觉“卡住没反应”
+    # 预启动处理队列 + 预热，避免第一次手写"没反应"
     demo.queue(default_concurrency_limit=4)
-
-    # 预热：启动时先完整跑一次识别流程，让第一次手写也能立即出结果
     try:
         if example_paths:
             warm = np.asarray(
@@ -426,7 +478,7 @@ def main():
             )
             handle(warm)
             print("预热完成：模型、特征图与页面组件已就绪")
-    except Exception as exc:  # 预热失败不影响使用
+    except Exception as exc:
         print(f"预热未完成（不影响使用）: {exc}")
 
     demo.launch(**launch_kwargs)
